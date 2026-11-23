@@ -16,10 +16,12 @@
 //   link, with the same closers and the same "at least one character
 //   between" rules) is unchanged; the scans are range-bounded to the same
 //   substring the reference recurses on.
-// - renderMarkdown() renders blocks straight into the output array while
-//   scanning the lines once, instead of lexing into token objects and then
-//   rendering them. Block boundaries, continuation rules and the excerpt /
-//   toc collection are the same.
+// - renderMarkdown() scans the body once by character index (no line
+//   array, no per-line regexes): block boundaries are char-code scans
+//   over line ranges, and a paragraph whose lines need no trimming is
+//   inline-rendered straight from its slice of the body. Block
+//   boundaries, continuation rules and the excerpt / toc collection are
+//   the same as the reference's.
 // - parseFrontMatter() scans line boundaries by index instead of splitting
 //   the whole body and re-joining it; the body is one slice.
 // - slugify() takes a fast ASCII path (NFKD is the identity on ASCII and
@@ -41,8 +43,10 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
+const ESC_TEST = /[&<>"']/;
 /** `text` with & < > " and ' escaped. */
 function escapeHtml(text) {
+  if (!ESC_TEST.test(text)) return text;
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
@@ -278,41 +282,138 @@ function parseFrontMatter(text) {
 
 // ---------------------------------------------------------------- markdown
 
-const BLANK = /^[ \t]*$/;
-const FENCE_OPEN = /^```([A-Za-z0-9_+-]*)[ \t]*$/;
-const FENCE_CLOSE = /^```[ \t]*$/;
-const HEADING = /^(#{1,6})[ \t]+(.*?)[ \t]*$/;
-const HR = /^(?:---|\*\*\*)[ \t]*$/;
-const BULLET = /^[-*] (.*)$/;
-const ORDERED = /^(\d{1,9})\. (.*)$/;
-const CONTINUED = /^ {2,}\S/;
-const TRIM_BOTH = /^[ \t]+|[ \t]+$/g;
+/**
+ * Range helpers for the single-pass markdown scan. Every helper works on
+ * src[a..b) — one line, no '\n' inside — and replicates the regex it
+ * replaces character by character, so the classification is identical.
+ */
 
-/** A heading line's level and text, or null. */
-function headingOf(line) {
-  if (line.charCodeAt(0) !== 35) return null;
-  const m = HEADING.exec(line);
-  return m === null || m[2] === '' ? null : { depth: m[1].length, text: m[2] };
+/** Whether src[a..b) is empty or only spaces/tabs (the BLANK regex). */
+function isBlankAt(src, a, b) {
+  for (let i = a; i < b; i++) {
+    const c = src.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
 }
 
-/** Whether `line` ends a paragraph. */
-function endsParagraph(line) {
-  if (line === '') return true;
-  const c0 = line.charCodeAt(0);
-  if (c0 === 96) return FENCE_OPEN.test(line);
-  if (c0 === 35) return headingOf(line) !== null;
-  if (c0 === 45 || c0 === 42) return HR.test(line);
-  if (c0 === 32 || c0 === 9) return BLANK.test(line);
+/**
+ * A fence opening at src[a..b): the index just past its language tag, or -1
+ * (the FENCE_OPEN regex: ``` + [A-Za-z0-9_+-]* + [ \t]*).
+ */
+function fenceOpenAt(src, a, b) {
+  if (b - a < 3 || src.charCodeAt(a) !== 96 || src.charCodeAt(a + 1) !== 96 || src.charCodeAt(a + 2) !== 96) return -1;
+  let k = a + 3;
+  while (k < b) {
+    const c = src.charCodeAt(k);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c === 95 || c === 43 || c === 45) k++;
+    else break;
+  }
+  for (let i = k; i < b; i++) {
+    const c = src.charCodeAt(i);
+    if (c !== 32 && c !== 9) return -1;
+  }
+  return k;
+}
+
+/** Whether src[a..b) closes a fence (the FENCE_CLOSE regex). */
+function fenceCloseAt(src, a, b) {
+  if (b - a < 3 || src.charCodeAt(a) !== 96 || src.charCodeAt(a + 1) !== 96 || src.charCodeAt(a + 2) !== 96) return false;
+  for (let i = a + 3; i < b; i++) {
+    const c = src.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+/**
+ * A heading at src[a..b): [depth, textStart, textEnd], or null (the HEADING
+ * regex: #{1,6} + [ \t]+ + text with trailing [ \t]* dropped; empty text
+ * is not a heading).
+ */
+function headingAt(src, a, b) {
+  if (src.charCodeAt(a) !== 35) return null;
+  let d = 0;
+  while (d < 6 && a + d < b && src.charCodeAt(a + d) === 35) d++;
+  if (d === 0 || a + d >= b) return null;
+  const c = src.charCodeAt(a + d);
+  if (c !== 32 && c !== 9) return null;
+  let s = a + d;
+  while (s < b && (src.charCodeAt(s) === 32 || src.charCodeAt(s) === 9)) s++;
+  let e = b;
+  while (e > s && (src.charCodeAt(e - 1) === 32 || src.charCodeAt(e - 1) === 9)) e--;
+  if (s >= e) return null;
+  return [d, s, e];
+}
+
+/** Whether src[a..b) is a horizontal rule (the HR regex). */
+function hrAt(src, a, b) {
+  if (b - a < 3) return false;
+  const c0 = src.charCodeAt(a);
+  if (c0 !== 45 && c0 !== 42) return false;
+  if (src.charCodeAt(a + 1) !== c0 || src.charCodeAt(a + 2) !== c0) return false;
+  for (let i = a + 3; i < b; i++) {
+    const c = src.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
+}
+
+/** A bullet item at src[a..b): its text start, or -1 (the BULLET regex). */
+function bulletAt(src, a, b) {
+  if (b - a < 2) return -1;
+  const c0 = src.charCodeAt(a);
+  if (c0 !== 45 && c0 !== 42) return -1;
+  if (src.charCodeAt(a + 1) !== 32) return -1;
+  return a + 2;
+}
+
+/**
+ * An ordered item at src[a..b): [start number, text start], or null (the
+ * ORDERED regex: 1-9 digits + ". " + text).
+ */
+function orderedAt(src, a, b) {
+  let d = 0;
+  while (d < 9 && a + d < b) {
+    const c = src.charCodeAt(a + d);
+    if (c < 48 || c > 57) break;
+    d++;
+  }
+  if (d === 0 || a + d + 1 >= b) return null;
+  if (src.charCodeAt(a + d) !== 46 || src.charCodeAt(a + d + 1) !== 32) return null;
+  return [Number(src.slice(a, a + d)), a + d + 2];
+}
+
+/**
+ * Whether src[a..b) continues a list item (the CONTINUED regex: 2+ spaces
+ * then a non-whitespace character; WS_TABLE is exactly JS \s).
+ */
+function continuedAt(src, a, b) {
+  let s = a;
+  while (s < b && src.charCodeAt(s) === 32) s++;
+  if (s - a < 2 || s >= b) return false;
+  return WS_TABLE[src.charCodeAt(s)] === 0;
+}
+
+/** Whether src[a..b) ends a paragraph (the endsParagraph rules). */
+function endsParaAt(src, a, b) {
+  if (a === b) return true;
+  const c0 = src.charCodeAt(a);
+  if (c0 === 96) return fenceOpenAt(src, a, b) !== -1;
+  if (c0 === 35) return headingAt(src, a, b) !== null;
+  if (c0 === 45 || c0 === 42) return hrAt(src, a, b);
+  if (c0 === 32 || c0 === 9) return isBlankAt(src, a, b);
   return false;
 }
 
-/** A paragraph line as it is rendered: spaces and tabs at either end dropped. */
-const trimLine = (line) => {
-  const c0 = line.charCodeAt(0);
-  const c1 = line.charCodeAt(line.length - 1);
-  if (c0 !== 32 && c0 !== 9 && c1 !== 32 && c1 !== 9) return line;
-  return line.replace(TRIM_BOTH, '');
-};
+/** src[a..b) with spaces and tabs at either end dropped, as [start, end). */
+function trimRange(src, a, b) {
+  let s = a;
+  let e = b;
+  while (s < e && (src.charCodeAt(s) === 32 || src.charCodeAt(s) === 9)) s++;
+  while (e > s && (src.charCodeAt(e - 1) === 32 || src.charCodeAt(e - 1) === 9)) e--;
+  return [s, e];
+}
 
 /** The characters a backslash escapes, as a char-code table (a Set lookup
  * here deoptimised the hot scanners). */
@@ -462,71 +563,111 @@ function inline(s, link) {
 }
 
 /**
- * `src` rendered in one pass over its lines: its HTML, its table of
+ * `src` rendered in one pass over its characters: its HTML, its table of
  * contents (every level 2 and 3 heading) and its excerpt (the first
- * paragraph's inline HTML, or ""). `slugMemo` is the case's slug cache.
- * Blocks are pushed straight into one parts array; only the excerpt and
- * the table of contents need a block's HTML as a string of its own.
+ * paragraph's inline HTML, or ""). No line array is built: the scan walks
+ * line ranges [pos, le) with indexOf('\n'), and every block test is a
+ * char-code scan over its own line. A paragraph whose lines need no
+ * trimming is inline-rendered straight from its range in `src` (the lines
+ * joined by '\n' are exactly that slice); only a paragraph with a
+ * leading/trailing space or tab on some line takes the slow path that
+ * trims and joins, exactly as before. Fence content is one slice, not a
+ * join of its lines. Blockquote and list bodies still build their joined
+ * strings — their lines are re-cut ('> ' stripped, continuations
+ * appended) so no slice exists — but over ranges, without a line array.
+ * `slugMemo` is the case's slug cache.
  */
 function renderMarkdown(src, link, slugMemo) {
-  const lines = src.split('\n');
-  const n = lines.length;
+  const N = src.length;
   const ids = new Set();
   const parts = [];
   const toc = [];
   let excerpt = null;
-  let i = 0;
-  while (i < n) {
-    const line = lines[i];
-    const c0 = line.charCodeAt(0);
-    if (line === '' || BLANK.test(line)) {
-      i++;
+  let pos = 0; // start of the current line
+  while (pos < N) {
+    const nl = src.indexOf('\n', pos);
+    const le = nl === -1 ? N : nl;
+    const next = nl === -1 ? N + 1 : nl + 1;
+    if (le === pos || isBlankAt(src, pos, le)) {
+      pos = next;
       continue;
     }
+    const c0 = src.charCodeAt(pos);
     if (c0 === 96) {
-      const fence = FENCE_OPEN.exec(line);
-      if (fence !== null) {
-        const lang = fence[1];
-        i++;
+      const k = fenceOpenAt(src, pos, le);
+      if (k !== -1) {
+        const lang = src.slice(pos + 3, k);
+        // Find the closing line; its start bounds the content slice.
+        let p = next;
+        let closeStart = -1;
+        let closeNext = N + 1;
+        while (p < N) {
+          const nl2 = src.indexOf('\n', p);
+          const le2 = nl2 === -1 ? N : nl2;
+          if (fenceCloseAt(src, p, le2)) {
+            closeStart = p;
+            closeNext = nl2 === -1 ? N + 1 : nl2 + 1;
+            break;
+          }
+          if (nl2 === -1) break;
+          p = nl2 + 1;
+        }
         parts.push('<pre><code', lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`, '>');
-        const start = i;
-        while (i < n && !FENCE_CLOSE.test(lines[i])) i++;
-        if (i > start) parts.push(escapeHtml(lines.slice(start, i).join('\n')), '\n');
-        i++;
+        if (closeStart === -1) {
+          // Unclosed: content runs to the end of the body; the joined
+          // lines are exactly src[next..N] (a trailing empty line, when
+          // the body ends with '\n', is the final '\n' of the slice).
+          if (next <= N) parts.push(escapeHtml(src.slice(next)), '\n');
+          pos = N + 1;
+        } else {
+          // Content lines joined by '\n' are src[next..closeStart-1]
+          // (the '\n' before the closing line is the last separator).
+          if (closeStart > next) parts.push(escapeHtml(src.slice(next, closeStart - 1)), '\n');
+          pos = closeNext;
+        }
         parts.push('</code></pre>\n');
         continue;
       }
     }
-    const heading = headingOf(line);
+    const heading = c0 === 35 ? headingAt(src, pos, le) : null;
     if (heading !== null) {
-      const id = uniqueSlug(slugify(heading.text, slugMemo), ids);
-      if (heading.depth === 2 || heading.depth === 3) {
+      const depth = heading[0];
+      const ts = heading[1];
+      const te = heading[2];
+      const id = uniqueSlug(slugify(src.slice(ts, te), slugMemo), ids);
+      if (depth === 2 || depth === 3) {
         const tmp = [];
-        inlineInto(heading.text, 0, heading.text.length, link, tmp);
+        inlineInto(src, ts, te, link, tmp);
         const html = tmp.join('');
-        parts.push(`<h${heading.depth} id="${id}">`, html, `</h${heading.depth}>\n`);
-        toc.push({ level: heading.depth, id, html });
+        parts.push(`<h${depth} id="${id}">`, html, `</h${depth}>\n`);
+        toc.push({ level: depth, id, html });
       } else {
-        parts.push(`<h${heading.depth} id="${id}">`);
-        inlineInto(heading.text, 0, heading.text.length, link, parts);
-        parts.push(`</h${heading.depth}>\n`);
+        parts.push(`<h${depth} id="${id}">`);
+        inlineInto(src, ts, te, link, parts);
+        parts.push(`</h${depth}>\n`);
       }
-      i++;
+      pos = next;
       continue;
     }
-    if ((c0 === 45 || c0 === 42) && HR.test(line)) {
+    if ((c0 === 45 || c0 === 42) && hrAt(src, pos, le)) {
       parts.push('<hr>\n');
-      i++;
+      pos = next;
       continue;
     }
     if (c0 === 62) {
-      const body = [];
-      while (i < n && lines[i].charCodeAt(0) === 62) body.push(lines[i++].replace(/^> ?/, ''));
       const kept = [];
-      for (const l of body) {
-        const t = trimLine(l);
-        if (t !== '') kept.push(t);
+      let p = pos;
+      while (p < N) {
+        const nl2 = src.indexOf('\n', p);
+        const le2 = nl2 === -1 ? N : nl2;
+        if (src.charCodeAt(p) !== 62) break;
+        let s = p + 1;
+        if (s < le2 && src.charCodeAt(s) === 32) s++;
+        const tr = trimRange(src, s, le2);
+        if (tr[0] < tr[1]) kept.push(src.slice(tr[0], tr[1]));
+        p = nl2 === -1 ? N + 1 : nl2 + 1;
       }
+      pos = p;
       if (kept.length === 0) parts.push('<blockquote>\n</blockquote>\n');
       else {
         const joined = kept.join('\n');
@@ -536,25 +677,34 @@ function renderMarkdown(src, link, slugMemo) {
       }
       continue;
     }
-    let bullet = null;
-    let ordered = null;
-    if (c0 === 45 || c0 === 42) bullet = BULLET.exec(line);
-    if (bullet === null && c0 >= 48 && c0 <= 57) ordered = ORDERED.exec(line);
-    if (bullet !== null || ordered !== null) {
-      const isOrdered = ordered !== null;
-      const marker = isOrdered ? ORDERED : BULLET;
-      const start = isOrdered ? Number(ordered[1]) : 1;
+    let bItem = -1;
+    let oItem = null;
+    if (c0 === 45 || c0 === 42) bItem = bulletAt(src, pos, le);
+    if (bItem === -1 && c0 >= 48 && c0 <= 57) oItem = orderedAt(src, pos, le);
+    if (bItem !== -1 || oItem !== null) {
+      const isOrdered = oItem !== null;
+      const start = isOrdered ? oItem[0] : 1;
       const items = [];
-      while (i < n) {
-        const mm = marker.exec(lines[i]);
-        if (mm !== null) {
-          items.push(trimLine(isOrdered ? mm[2] : mm[1]));
-          i++;
-        } else if (lines[i].charCodeAt(0) === 32 && lines[i].charCodeAt(1) === 32 && CONTINUED.test(lines[i])) {
-          items[items.length - 1] += `\n${trimLine(lines[i])}`;
-          i++;
+      let p = pos;
+      while (p < N) {
+        const nl2 = src.indexOf('\n', p);
+        const le2 = nl2 === -1 ? N : nl2;
+        let istart = -1;
+        if (isOrdered) {
+          const o = orderedAt(src, p, le2);
+          if (o !== null) istart = o[1];
+        } else istart = bulletAt(src, p, le2);
+        if (istart !== -1) {
+          const tr = trimRange(src, istart, le2);
+          items.push(src.slice(tr[0], tr[1]));
+          p = nl2 === -1 ? N + 1 : nl2 + 1;
+        } else if (continuedAt(src, p, le2)) {
+          const tr = trimRange(src, p, le2);
+          items[items.length - 1] += `\n${src.slice(tr[0], tr[1])}`;
+          p = nl2 === -1 ? N + 1 : nl2 + 1;
         } else break;
       }
+      pos = p;
       const tag = isOrdered ? 'ol' : 'ul';
       parts.push(isOrdered && start !== 1 ? `<ol start="${start}">` : `<${tag}>`, '\n');
       for (const item of items) {
@@ -565,17 +715,61 @@ function renderMarkdown(src, link, slugMemo) {
       parts.push(`</${tag}>\n`);
       continue;
     }
-    const body = [trimLine(line)];
-    i++;
-    while (i < n && !endsParagraph(lines[i])) body.push(trimLine(lines[i++]));
-    const text = body.join('\n');
-    if (excerpt === null) {
-      excerpt = inline(text, link);
-      parts.push('<p>', excerpt, '</p>\n');
+    // Paragraph: lines until one ends it. Track whether any line needs
+    // trimming; when none does, the paragraph text is the slice itself.
+    let a = pos;
+    let b = le;
+    let nx = next;
+    let trim = false;
+    let lastEnd = le;
+    for (;;) {
+      if (b > a) {
+        const ca = src.charCodeAt(a);
+        const cb = src.charCodeAt(b - 1);
+        if (ca === 32 || ca === 9 || cb === 32 || cb === 9) trim = true;
+      }
+      lastEnd = b;
+      if (nx > N) break;
+      const nl2 = src.indexOf('\n', nx);
+      const le2 = nl2 === -1 ? N : nl2;
+      if (endsParaAt(src, nx, le2)) break;
+      a = nx;
+      b = le2;
+      nx = nl2 === -1 ? N + 1 : nl2 + 1;
+    }
+    const pStart = pos;
+    pos = nx;
+    if (!trim) {
+      if (excerpt === null) {
+        const tmp = [];
+        inlineInto(src, pStart, lastEnd, link, tmp);
+        excerpt = tmp.join('');
+        parts.push('<p>', excerpt, '</p>\n');
+      } else {
+        parts.push('<p>');
+        inlineInto(src, pStart, lastEnd, link, parts);
+        parts.push('</p>\n');
+      }
     } else {
-      parts.push('<p>');
-      inlineInto(text, 0, text.length, link, parts);
-      parts.push('</p>\n');
+      const body = [];
+      let q = pStart;
+      while (q <= lastEnd) {
+        const nl2 = src.indexOf('\n', q);
+        const le2 = nl2 === -1 || nl2 > lastEnd ? lastEnd : nl2;
+        const tr = trimRange(src, q, le2);
+        body.push(src.slice(tr[0], tr[1]));
+        if (nl2 === -1 || nl2 >= lastEnd) break;
+        q = nl2 + 1;
+      }
+      const text = body.join('\n');
+      if (excerpt === null) {
+        excerpt = inline(text, link);
+        parts.push('<p>', excerpt, '</p>\n');
+      } else {
+        parts.push('<p>');
+        inlineInto(text, 0, text.length, link, parts);
+        parts.push('</p>\n');
+      }
     }
   }
   return { html: parts.join(''), parts, toc, excerpt: excerpt ?? '' };
@@ -794,9 +988,10 @@ function analyzeConstant(templates) {
 }
 
 /**
- * A parsed template's nodes compiled to a function (out, S, D, X): S is the
- * scope's vars object (null-prototype chain), D the include depth, X the
- * context { fns, esc, txt, tr }. Straight-line code replaces the node-tree
+ * A parsed template's nodes compiled to a function (out, S, D, X, esc, txt,
+ * tr): S is the scope's vars object (null-prototype chain), D the include
+ * depth, X the context { fns, cache }, and esc/txt/tr the helpers as direct
+ * parameters (no per-call property lookup). Straight-line code replaces the
  * walk: no per-node dispatch, no recursion except through includes (which
  * are direct calls, depth-checked like the reference). A for-node reuses one
  * child scope and one loop record per execution, mutated per iteration —
@@ -815,10 +1010,10 @@ function compileTemplate(name, nodes, constSet) {
         code += `out.push(${JSON.stringify(node.text)});\n`;
       } else if (node.kind === 'var' || node.kind === 'raw') {
         const l = lookupExpr(node.path, scope);
-        code += node.kind === 'var' ? `out.push(X.esc(X.txt(${l})));\n` : `out.push(X.txt(${l}));\n`;
+        code += node.kind === 'var' ? `out.push(esc(txt(${l})));\n` : `out.push(txt(${l}));\n`;
       } else if (node.kind === 'if') {
         const l = lookupExpr(node.path, scope);
-        const cond = node.not ? `!X.tr(${l})` : `X.tr(${l})`;
+        const cond = node.not ? `!tr(${l})` : `tr(${l})`;
         code += `if(${cond}){\n`;
         gen(node.then, scope);
         code += '}';
@@ -848,15 +1043,15 @@ function compileTemplate(name, nodes, constSet) {
           // string, and push it on later renders. The depth is part of the
           // key: a constant template's own includes stop at depth 8, so its
           // output can differ by the depth it is rendered at.
-          code += `if(D<8){const _ck=${JSON.stringify(node.name)}+'|'+D;let _cs=X.cache.get(_ck);if(_cs===undefined){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined){const _o=[];_f(_o,${scope},D+1,X);_cs=_o.join('');}else{_cs='';}X.cache.set(_ck,_cs);}out.push(_cs);}\n`;
+          code += `if(D<8){const _ck=${JSON.stringify(node.name)}+'|'+D;let _cs=X.cache.get(_ck);if(_cs===undefined){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined){const _o=[];_f(_o,${scope},D+1,X,esc,txt,tr);_cs=_o.join('');}else{_cs='';}X.cache.set(_ck,_cs);}out.push(_cs);}\n`;
         } else {
-          code += `if(D<8){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined)_f(out,${scope},D+1,X);}\n`;
+          code += `if(D<8){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined)_f(out,${scope},D+1,X,esc,txt,tr);}\n`;
         }
       }
     }
   };
   gen(nodes, 'S');
-  return new Function('out', 'S', 'D', 'X', code);
+  return new Function('out', 'S', 'D', 'X', 'esc', 'txt', 'tr', code);
 }
 
 /**
@@ -980,7 +1175,7 @@ export function build(input) {
   } catch (err) {
     compiled = null;
   }
-  const X = compiled === null ? null : { fns: compiled, esc: escapeHtml, txt: textOf, tr: truthy, cache: new Map(), constSet };
+  const X = compiled === null ? null : { fns: compiled, cache: new Map() };
   const base = input.site.base_url.replace(/\/+$/, '');
   const sources = [];
   const statics = [];
@@ -1179,7 +1374,7 @@ export function build(input) {
     if (compiled !== null) {
       const fn = compiled.get(name);
       if (fn === undefined) return null;
-      fn(out, rootVars, 0, X);
+      fn(out, rootVars, 0, X, escapeHtml, textOf, truthy);
     } else {
       const nodes = templates.get(name);
       if (nodes === undefined) return null;
