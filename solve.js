@@ -431,45 +431,7 @@ const escapable = (c) => c < 128 && ESCAPABLE[c] === 1;
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
 const WS_RE = /\s/;
 
-/**
- * The first index in [from, to) where `s` holds `what` outside an escape, or
- * -1. A run of backslashes before an occurrence escapes it exactly when the
- * run is odd: the reference scan consumes backslash pairs from `from`, so an
- * even run is all pairs and the occurrence stands, while an odd run leaves
- * one backslash that pairs with `what`'s first character (always escapable
- * for the `what`s used here, `**` and `]`). Native indexOf finds the
- * candidates; only the backslash run before each is counted.
- */
-function findUnescaped(s, what, from, to) {
-  const wl = what.length;
-  let k = s.indexOf(what, from);
-  while (k !== -1 && k + wl <= to) {
-    let r = 0;
-    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) r++;
-    if (r % 2 === 0) return k;
-    k = s.indexOf(what, k + 1);
-  }
-  return -1;
-}
 
-/** The first single * in [from, to), or -1 (same backslash-run rule). */
-function findSingleStar(s, from, to) {
-  let k = s.indexOf('*', from);
-  while (k !== -1 && k < to) {
-    let r = 0;
-    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) r++;
-    if (r % 2 === 1) {
-      k = s.indexOf('*', k + 1);
-      continue;
-    }
-    if (k + 1 < to && s.charCodeAt(k + 1) === 42) {
-      k = s.indexOf('*', k + 2);
-      continue;
-    }
-    return k;
-  }
-  return -1;
-}
 
 /**
  * `s[from..to)` rendered inline, appended to `out`. `link(target)` is a
@@ -512,7 +474,14 @@ function inlineInto(s, from, to, link, out) {
     }
     if (c === '*') {
       if (j + 1 < to && s[j + 1] === '*') {
-        const k = findUnescaped(s, '**', j + 2, to);
+        let k = s.indexOf('**', j + 2);
+        while (k !== -1 && k + 2 <= to) {
+          let r = 0;
+          for (let q = k - 1; q >= j + 2 && s.charCodeAt(q) === 92; q--) r++;
+          if (r % 2 === 0) break;
+          k = s.indexOf('**', k + 1);
+        }
+        if (k === -1 || k + 2 > to) k = -1;
         if (k > j + 2) {
           out.push('<strong>');
           inlineInto(s, j + 2, k, link, out);
@@ -523,7 +492,15 @@ function inlineInto(s, from, to, link, out) {
           i = j + 2;
         }
       } else {
-        const k = findSingleStar(s, j + 1, to);
+        let k = s.indexOf('*', j + 1);
+        while (k !== -1 && k < to) {
+          let r = 0;
+          for (let q = k - 1; q >= j + 1 && s.charCodeAt(q) === 92; q--) r++;
+          if (r % 2 === 1) { k = s.indexOf('*', k + 1); continue; }
+          if (k + 1 < to && s.charCodeAt(k + 1) === 42) { k = s.indexOf('*', k + 2); continue; }
+          break;
+        }
+        if (k === -1 || k >= to) k = -1;
         if (k > j + 1) {
           out.push('<em>');
           inlineInto(s, j + 1, k, link, out);
@@ -537,7 +514,14 @@ function inlineInto(s, from, to, link, out) {
       continue;
     }
     if (c === '[') {
-      const k = findUnescaped(s, ']', j + 1, to);
+      let k = s.indexOf(']', j + 1);
+      while (k !== -1 && k + 1 <= to) {
+        let r = 0;
+        for (let q = k - 1; q >= j + 1 && s.charCodeAt(q) === 92; q--) r++;
+        if (r % 2 === 0) break;
+        k = s.indexOf(']', k + 1);
+      }
+      if (k === -1 || k + 1 > to) k = -1;
       let mm = -1;
       if (k !== -1 && k + 1 < to && s[k + 1] === '(') {
         const r = s.indexOf(')', k + 2);
@@ -593,11 +577,15 @@ function renderMarkdown(src, link, slugMemo) {
     const nl = src.indexOf('\n', pos);
     const le = nl === -1 ? N : nl;
     const next = nl === -1 ? N + 1 : nl + 1;
-    if (le === pos || isBlankAt(src, pos, le)) {
+    if (le === pos) {
       pos = next;
       continue;
     }
     const c0 = src.charCodeAt(pos);
+    if ((c0 === 32 || c0 === 9) && isBlankAt(src, pos, le)) {
+      pos = next;
+      continue;
+    }
     if (c0 === 96) {
       const k = fenceOpenAt(src, pos, le);
       if (k !== -1) {
@@ -777,7 +765,7 @@ function renderMarkdown(src, link, slugMemo) {
       }
     }
   }
-  return { html: parts.join(''), parts, toc, excerpt: excerpt ?? '' };
+  return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -909,6 +897,23 @@ function textOf(v) {
 function truthy(v) {
   if (Array.isArray(v)) return v.length > 0;
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
+}
+
+/**
+ * escapeHtml(textOf(v)) as one call (the generated var-node path): strings
+ * are escaped in place, numbers/booleans stringify with no specials, arrays
+ * go through textOf then escaping, everything else is '' — exactly the
+ * reference's esc(txt(v)) for every value shape.
+ */
+function escTxt(v) {
+  if (typeof v === 'string') {
+    if (!ESC_TEST.test(v)) return v;
+    return v.replace(/[&<>"']/g, (c) => ESCAPES[c]);
+  }
+  if (typeof v === 'number') return String(v);
+  if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (Array.isArray(v)) return escapeHtml(textOf(v));
+  return '';
 }
 
 /**
@@ -1044,7 +1049,7 @@ function compileTemplate(name, nodes, constSet) {
         code += `out.push(${JSON.stringify(node.text)});\n`;
       } else if (node.kind === 'var' || node.kind === 'raw') {
         const l = lookupExpr(node.path, scope);
-        code += node.kind === 'var' ? `out.push(esc(txt(${l})));\n` : `out.push(txt(${l}));\n`;
+        code += node.kind === 'var' ? `out.push(et(${l}));\n` : `out.push(txt(${l}));\n`;
       } else if (node.kind === 'if') {
         const l = lookupExpr(node.path, scope);
         const cond = node.not ? `!tr(${l})` : `tr(${l})`;
@@ -1077,15 +1082,15 @@ function compileTemplate(name, nodes, constSet) {
           // string, and push it on later renders. The depth is part of the
           // key: a constant template's own includes stop at depth 8, so its
           // output can differ by the depth it is rendered at.
-          code += `if(D<8){const _ck=${JSON.stringify(node.name)}+'|'+D;let _cs=X.cache.get(_ck);if(_cs===undefined){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined){const _o=[];_f(_o,${scope},D+1,X,esc,txt,tr);_cs=_o.join('');}else{_cs='';}X.cache.set(_ck,_cs);}out.push(_cs);}\n`;
+          code += `if(D<8){const _ck=${JSON.stringify(node.name)}+'|'+D;let _cs=X.cache.get(_ck);if(_cs===undefined){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined){const _o=[];_f(_o,${scope},D+1,X,esc,txt,tr,et);_cs=_o.join('');}else{_cs='';}X.cache.set(_ck,_cs);}out.push(_cs);}\n`;
         } else {
-          code += `if(D<8){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined)_f(out,${scope},D+1,X,esc,txt,tr);}\n`;
+          code += `if(D<8){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined)_f(out,${scope},D+1,X,esc,txt,tr,et);}\n`;
         }
       }
     }
   };
   gen(nodes, 'S');
-  return new Function('out', 'S', 'D', 'X', 'esc', 'txt', 'tr', code);
+  return new Function('out', 'S', 'D', 'X', 'esc', 'txt', 'tr', 'et', code);
 }
 
 /**
@@ -1292,7 +1297,6 @@ export function build(input) {
     };
     const md = renderMarkdown(s.body, link, slugMemo);
     s.html = md.html;
-    s.parts = md.parts;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
   }
@@ -1308,12 +1312,12 @@ export function build(input) {
   // Tags, grouped by slug, each named as first met in the posts' order.
   const bySlug = new Map();
   const ownTags = (s) => {
-    const seen = new Set();
+    const seen = [];
     const out = [];
     for (const name of s.data.tags ?? []) {
       const slug = slugify(name, slugMemo);
-      if (!seen.has(slug)) {
-        seen.add(slug);
+      if (seen.indexOf(slug) === -1) {
+        seen.push(slug);
         out.push(name);
       }
     }
@@ -1364,6 +1368,7 @@ export function build(input) {
     }
     return rm;
   };
+  const TAG_VIEW = Symbol('tagView');
   for (const s of kept) {
     s.title = s.data.title;
     s.date = s.data.date ?? '';
@@ -1371,7 +1376,7 @@ export function build(input) {
     s.summary = s.data.summary ?? '';
     s.content = s.html;
     s.is_post = s.post;
-    s.tags = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
+    s.tags = s.tagRefs.map((t) => (t[TAG_VIEW] ??= { name: t.name, slug: t.slug, url: t.url }));
     if (s.post) s.reading_minutes = readingMinutes(s);
   }
   const site = { title: input.site.title, base_url: base };
@@ -1388,16 +1393,18 @@ export function build(input) {
   // off this object, and no Object.prototype member may leak in as a value.
   const rootVars = Object.assign(Object.create(null), { site, tags: allTags, recent, page: undefined, posts: undefined, pager: undefined, tag: undefined });
   const rootScope = { vars: rootVars, parent: null };
+  const outBuf = [];
   const render = (name, page, plist, pager, tag) => {
     rootVars.page = page;
     rootVars.posts = plist;
     rootVars.pager = pager;
     rootVars.tag = tag;
-    const out = [];
+    const out = outBuf;
+    out.length = 0;
     if (compiled !== null) {
       const fn = compiled.get(name);
       if (fn === undefined) return null;
-      fn(out, rootVars, 0, X, escapeHtml, textOf, truthy);
+      fn(out, rootVars, 0, X, escapeHtml, textOf, truthy, escTxt);
     } else {
       const nodes = templates.get(name);
       if (nodes === undefined) return null;
