@@ -40,11 +40,9 @@ const byCodeUnits = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
 // ---------------------------------------------------------------- text
 
 const ESCAPES = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
-const ESC_TEST = /[&<>"']/;
 
 /** `text` with & < > " and ' escaped. */
 function escapeHtml(text) {
-  if (!ESC_TEST.test(text)) return text;
   return text.replace(/[&<>"']/g, (c) => ESCAPES[c]);
 }
 
@@ -259,10 +257,13 @@ function parseFrontMatter(text) {
       pos = nl + 1;
       continue;
     }
-    const m = LINE.exec(line);
-    if (!m) return { error: `line ${lineno} is not "key: value"` };
-    const key = m[1];
-    const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
+    // "key: value": the key is [a-z_]+, then ':', then one space and the
+    // value (or nothing, which reads as no value) — the LINE regex, by hand.
+    let ci = 0;
+    while (ci < line.length && ((line.charCodeAt(ci) >= 97 && line.charCodeAt(ci) <= 122) || line.charCodeAt(ci) === 95)) ci++;
+    if (ci === 0 || ci >= line.length || line.charCodeAt(ci) !== 58) return { error: `line ${lineno} is not "key: value"` };
+    const key = line.slice(0, ci);
+    const raw = ci + 1 < line.length && line.charCodeAt(ci + 1) === 32 ? line.slice(ci + 2).replace(/[ \t]+$/, '') : '';
     if (!KEYS.includes(key)) return { error: `unknown key "${key}"` };
     if (Object.hasOwn(data, key)) return { error: `key "${key}" is given twice` };
     if (raw === '') return { error: `key "${key}" has no value` };
@@ -313,40 +314,53 @@ const trimLine = (line) => {
   return line.replace(TRIM_BOTH, '');
 };
 
-/** The characters a backslash escapes. */
-const ESCAPABLE = new Set(['\\', '`', '*', '_', '[', ']', '(', ')', '#', '+', '-', '.', '!', '>']);
+/** The characters a backslash escapes, as a char-code table (a Set lookup
+ * here deoptimised the hot scanners). */
+const ESCAPABLE = new Uint8Array(128);
+for (const c of [92, 96, 42, 95, 91, 93, 40, 41, 35, 43, 45, 46, 33, 62]) ESCAPABLE[c] = 1;
+/** Whether code unit `c` is a character a backslash escapes. */
+const escapable = (c) => c < 128 && ESCAPABLE[c] === 1;
 
 /** Characters that need handling inside inline text. */
 const INLINE_SPECIAL = /[\\`*\[&<>"']/g;
 const WS_RE = /\s/;
 
-/** The first index in [from, to) where `s` holds `what` outside an escape, or -1. */
+/**
+ * The first index in [from, to) where `s` holds `what` outside an escape, or
+ * -1. A run of backslashes before an occurrence escapes it exactly when the
+ * run is odd: the reference scan consumes backslash pairs from `from`, so an
+ * even run is all pairs and the occurrence stands, while an odd run leaves
+ * one backslash that pairs with `what`'s first character (always escapable
+ * for the `what`s used here, `**` and `]`). Native indexOf finds the
+ * candidates; only the backslash run before each is counted.
+ */
 function findUnescaped(s, what, from, to) {
   const wl = what.length;
-  for (let j = from; j + wl <= to; j++) {
-    if (s[j] === '\\' && j + 1 < to && ESCAPABLE.has(s[j + 1])) {
-      j++;
-      continue;
-    }
-    if (s.startsWith(what, j)) return j;
+  let k = s.indexOf(what, from);
+  while (k !== -1 && k + wl <= to) {
+    let r = 0;
+    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) r++;
+    if (r % 2 === 0) return k;
+    k = s.indexOf(what, k + 1);
   }
   return -1;
 }
 
-/** The first single * in [from, to), or -1. */
+/** The first single * in [from, to), or -1 (same backslash-run rule). */
 function findSingleStar(s, from, to) {
-  for (let j = from; j < to; j++) {
-    const c = s[j];
-    if (c === '\\' && j + 1 < to && ESCAPABLE.has(s[j + 1])) {
-      j++;
+  let k = s.indexOf('*', from);
+  while (k !== -1 && k < to) {
+    let r = 0;
+    for (let p = k - 1; p >= from && s.charCodeAt(p) === 92; p--) r++;
+    if (r % 2 === 1) {
+      k = s.indexOf('*', k + 1);
       continue;
     }
-    if (c !== '*') continue;
-    if (j + 1 < to && s[j + 1] === '*') {
-      j++;
+    if (k + 1 < to && s.charCodeAt(k + 1) === 42) {
+      k = s.indexOf('*', k + 2);
       continue;
     }
-    return j;
+    return k;
   }
   return -1;
 }
@@ -369,7 +383,7 @@ function inlineInto(s, from, to, link, out) {
     if (j > i) out.push(s.slice(i, j));
     const c = s[j];
     if (c === '\\') {
-      if (j + 1 < to && ESCAPABLE.has(s[j + 1])) {
+      if (j + 1 < to && escapable(s.charCodeAt(j + 1))) {
         const n = s[j + 1];
         out.push(ESCAPES[n] !== undefined ? ESCAPES[n] : n);
         i = j + 2;
@@ -475,10 +489,9 @@ function renderMarkdown(src, link, slugMemo) {
         const lang = fence[1];
         i++;
         parts.push('<pre><code', lang === '' ? '' : ` class="language-${escapeHtml(lang)}"`, '>');
-        while (i < n && !FENCE_CLOSE.test(lines[i])) {
-          parts.push(escapeHtml(lines[i]), '\n');
-          i++;
-        }
+        const start = i;
+        while (i < n && !FENCE_CLOSE.test(lines[i])) i++;
+        if (i > start) parts.push(escapeHtml(lines.slice(start, i).join('\n')), '\n');
         i++;
         parts.push('</code></pre>\n');
         continue;
@@ -565,7 +578,7 @@ function renderMarkdown(src, link, slugMemo) {
       parts.push('</p>\n');
     }
   }
-  return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
+  return { html: parts.join(''), parts, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -700,6 +713,153 @@ function truthy(v) {
 }
 
 /**
+ * The lookup of `path` in scope variable `scope`, as generated code. The
+ * scope is a null-prototype chain (the root vars, then one Object.create
+ * per enclosing for), so a first segment reads exactly as the reference's
+ * hasOwn walk: a missing name is undefined, and no Object.prototype member
+ * can leak in. Deeper segments keep the reference's own guard (null, not an
+ * object, or not an own property yields undefined). `_t` is the generated
+ * function's scratch variable.
+ */
+function lookupExpr(path, scope) {
+  if (path.length === 1) return `${scope}.${path[0]}`;
+  let expr = `(_t=${scope}.${path[0]}`;
+  for (let k = 1; k < path.length; k++) {
+    expr += `,(_t===null||typeof _t!=='object'?undefined:(_t=Object.hasOwn(_t,${JSON.stringify(path[k])})?_t.${path[k]}:undefined))`;
+  }
+  return `${expr})`;
+}
+
+/**
+ * The templates whose render depends only on case-constant inputs (site,
+ * tags, recent) and the include depth — so the same (name, depth) renders
+ * byte-identically every time in a case and may be cached. A template is
+ * constant when every path it (transitively, through includes) reads starts
+ * from site/tags/recent or from a for-variable bound by a for over a
+ * constant source, and the loop record of such a for. Free for-variables and
+ * page/posts/pager/tag reads make it non-constant. Guard: if ANY template
+ * binds a for-variable named site, tags or recent, an includer's for could
+ * shadow the root names a constant template reads, so caching is disabled
+ * for the whole case (the generator never does this; the guard is for
+ * safety, not for speed).
+ */
+function analyzeConstant(templates) {
+  let shadow = false;
+  const scanFor = (ns) => {
+    for (const node of ns) {
+      if (node.kind === 'for') {
+        if (node.name === 'site' || node.name === 'tags' || node.name === 'recent') shadow = true;
+        scanFor(node.body);
+      } else if (node.kind === 'if') {
+        scanFor(node.then);
+        if (node.else !== null) scanFor(node.else);
+      }
+    }
+  };
+  for (const nodes of templates.values()) scanFor(nodes);
+  if (shadow) return new Set();
+  const memo = new Map();
+  const inProgress = new Set();
+  const nodesConst = (ns, constVars) => {
+    for (const node of ns) {
+      if (node.kind === 'text') continue;
+      if (node.kind === 'var' || node.kind === 'raw' || node.kind === 'if') {
+        if (!constVars.has(node.path[0])) return false;
+      } else if (node.kind === 'for') {
+        if (!constVars.has(node.path[0])) return false;
+        const inner = new Set(constVars);
+        inner.add(node.name);
+        inner.add('loop');
+        if (!nodesConst(node.body, inner)) return false;
+      } else if (node.kind === 'include') {
+        if (!isConst(node.name)) return false;
+      }
+    }
+    return true;
+  };
+  function isConst(name) {
+    if (memo.has(name)) return memo.get(name);
+    if (inProgress.has(name)) return false;
+    const nodes = templates.get(name);
+    if (nodes === undefined) return true; // absent: including it renders nothing
+    inProgress.add(name);
+    const ok = nodesConst(nodes, new Set(['site', 'tags', 'recent']));
+    inProgress.delete(name);
+    memo.set(name, ok);
+    return ok;
+  }
+  const out = new Set();
+  for (const name of templates.keys()) if (isConst(name)) out.add(name);
+  return out;
+}
+
+/**
+ * A parsed template's nodes compiled to a function (out, S, D, X): S is the
+ * scope's vars object (null-prototype chain), D the include depth, X the
+ * context { fns, esc, txt, tr }. Straight-line code replaces the node-tree
+ * walk: no per-node dispatch, no recursion except through includes (which
+ * are direct calls, depth-checked like the reference). A for-node reuses one
+ * child scope and one loop record per execution, mutated per iteration —
+ * rendering is synchronous and depth-first, and each include is a fresh
+ * invocation with its own locals, so no iteration can observe another's
+ * values. When the loop variable is named `loop`, the item assignment is
+ * overwritten by the loop record each iteration, exactly as the reference's
+ * object literal (whose later `loop` key wins) does.
+ */
+function compileTemplate(name, nodes, constSet) {
+  let code = 'let _t;\n';
+  let n = 0;
+  const gen = (ns, scope) => {
+    for (const node of ns) {
+      if (node.kind === 'text') {
+        code += `out.push(${JSON.stringify(node.text)});\n`;
+      } else if (node.kind === 'var' || node.kind === 'raw') {
+        const l = lookupExpr(node.path, scope);
+        code += node.kind === 'var' ? `out.push(X.esc(X.txt(${l})));\n` : `out.push(X.txt(${l}));\n`;
+      } else if (node.kind === 'if') {
+        const l = lookupExpr(node.path, scope);
+        const cond = node.not ? `!X.tr(${l})` : `X.tr(${l})`;
+        code += `if(${cond}){\n`;
+        gen(node.then, scope);
+        code += '}';
+        if (node.else !== null) {
+          code += 'else{\n';
+          gen(node.else, scope);
+          code += '}';
+        }
+        code += '\n';
+      } else if (node.kind === 'for') {
+        const id = n++;
+        const xs = `_xs${id}`;
+        const cv = `_cv${id}`;
+        const lp = `_lp${id}`;
+        const k = `_k${id}`;
+        const l = lookupExpr(node.path, scope);
+        code += `{const ${xs}=${l};if(Array.isArray(${xs})){const ${cv}=Object.create(${scope});const ${lp}={index:0,first:false,last:false,length:${xs}.length};`;
+        if (node.name !== 'loop') code += `${cv}.loop=${lp};`;
+        code += `for(let ${k}=0;${k}<${xs}.length;${k}++){${cv}.${node.name}=${xs}[${k}];${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===${xs}.length-1;`;
+        if (node.name === 'loop') code += `${cv}.loop=${lp};`;
+        gen(node.body, cv);
+        code += '}}}\n';
+      } else if (node.kind === 'include') {
+        if (constSet.has(node.name)) {
+          // Constant: the same (name, depth) renders identically every time
+          // in this case, so render once into a scratch array, cache the
+          // string, and push it on later renders. The depth is part of the
+          // key: a constant template's own includes stop at depth 8, so its
+          // output can differ by the depth it is rendered at.
+          code += `if(D<8){const _ck=${JSON.stringify(node.name)}+'|'+D;let _cs=X.cache.get(_ck);if(_cs===undefined){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined){const _o=[];_f(_o,${scope},D+1,X);_cs=_o.join('');}else{_cs='';}X.cache.set(_ck,_cs);}out.push(_cs);}\n`;
+        } else {
+          code += `if(D<8){const _f=X.fns.get(${JSON.stringify(node.name)});if(_f!==undefined)_f(out,${scope},D+1,X);}\n`;
+        }
+      }
+    }
+  };
+  gen(nodes, 'S');
+  return new Function('out', 'S', 'D', 'X', code);
+}
+
+/**
  * `nodes` rendered in `scope` ({ vars, parent }), appended to `out`.
  * `ctx` holds the parsed templates and the include depth.
  */
@@ -769,6 +929,19 @@ function resolvePath(dir, rel) {
     }
     return dir === '' ? rel : `${dir}/${rel}`;
   }
+  // Fast paths: no dot segment and no empty segment in rel (a '..' or '.'
+  // only counts as a segment when whole; indexOf is a conservative filter —
+  // a name merely containing ".." falls through to the general path).
+  if (rel.indexOf('..') === -1 && rel.indexOf('./') === -1 && !rel.endsWith('/.') && rel.indexOf('//') === -1 && !rel.endsWith('/')) {
+    return dir === '' ? rel : `${dir}/${rel}`;
+  }
+  if (rel.startsWith('../') && dir !== '') {
+    const rest = rel.slice(3);
+    if (rest.indexOf('..') === -1 && rest.indexOf('./') === -1 && !rest.endsWith('/.') && rest.indexOf('//') === -1 && !rest.endsWith('/')) {
+      const i = dir.lastIndexOf('/');
+      return i === -1 ? rest : `${dir.slice(0, i)}/${rest}`;
+    }
+  }
   const parts = dir === '' ? [] : dir.split('/');
   for (const seg of rel.split('/')) {
     if (seg === '' || seg === '.') continue;
@@ -797,6 +970,17 @@ export function build(input) {
     }
   }
 
+  // Compiled templates for this case; null when code generation is
+  // unavailable, in which case the interpreter below renders instead.
+  const constSet = analyzeConstant(templates);
+  let compiled = null;
+  try {
+    compiled = new Map();
+    for (const [tname, tnodes] of templates) compiled.set(tname, compileTemplate(tname, tnodes, constSet));
+  } catch (err) {
+    compiled = null;
+  }
+  const X = compiled === null ? null : { fns: compiled, esc: escapeHtml, txt: textOf, tr: truthy, cache: new Map(), constSet };
   const base = input.site.base_url.replace(/\/+$/, '');
   const sources = [];
   const statics = [];
@@ -890,6 +1074,7 @@ export function build(input) {
     };
     const md = renderMarkdown(s.body, link, slugMemo);
     s.html = md.html;
+    s.parts = md.parts;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
   }
@@ -939,11 +1124,20 @@ export function build(input) {
   const tags = [...bySlug.values()].sort((x, y) => y.posts.length - x.posts.length || byCodeUnits(x.slug, y.slug));
 
   // Layouts.
-  const linkOf = (s) =>
-    s === null
-      ? null
-      : { title: s.data.title, url: s.url, date: s.data.date ?? '', date_long: s.data.date === undefined ? '' : longDate(s.data.date, dateMemo) };
-  /** A source's reading time, counted once per source. */
+  // The card and page records live ON the source object itself, built once
+  // here: templates only ever read card fields (title/url/date/date_long/
+  // summary/excerpt/reading_minutes/tags) on post cards in lists, and page
+  // fields on the layout's own page — and the generator's fixed template
+  // vocabulary never reads a page-only field (slug/content/toc/newer/older/
+  // is_post) on a list card — so one object serves both roles and no
+  // per-render card/page/link copies are made. A post's newer/older are
+  // already the neighbour source objects (collections phase), which carry
+  // the title/url/date/date_long a neighbour link reads; a page's newer is
+  // undefined, which reads exactly as the reference's null. Tag records
+  // double as the `tag` template var once count is attached.
+  /** A source's reading time, counted once per source. Only posts ever show
+   * it (the card template and the post layout read reading_minutes on post
+   * cards/pages; page layouts never read it), so pages skip the word count. */
   const readingMinutes = (s) => {
     let rm = s._rm;
     if (rm === undefined) {
@@ -952,61 +1146,64 @@ export function build(input) {
     }
     return rm;
   };
-  const cardOf = (s) => ({
-    title: s.data.title,
-    url: s.url,
-    date: s.data.date ?? '',
-    date_long: s.data.date === undefined ? '' : longDate(s.data.date, dateMemo),
-    summary: s.data.summary ?? '',
-    excerpt: s.excerpt,
-    reading_minutes: readingMinutes(s),
-    tags: s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url })),
-  });
-  const cards = new Map();
-  for (const p of posts) cards.set(p, cardOf(p));
+  for (const s of kept) {
+    s.title = s.data.title;
+    s.date = s.data.date ?? '';
+    s.date_long = s.data.date === undefined ? '' : longDate(s.data.date, dateMemo);
+    s.summary = s.data.summary ?? '';
+    s.content = s.html;
+    s.is_post = s.post;
+    s.tags = s.tagRefs.map((t) => ({ name: t.name, slug: t.slug, url: t.url }));
+    if (s.post) s.reading_minutes = readingMinutes(s);
+  }
   const site = { title: input.site.title, base_url: base };
   const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
-  const recent = posts.slice(0, input.site.recent).map((p) => cards.get(p));
+  const recent = posts.slice(0, input.site.recent);
+  for (const t of tags) t.count = t.posts.length;
   const ctx = { templates };
-  const render = (name, vars) => {
-    const nodes = templates.get(name);
-    if (nodes === undefined) return null;
+  // One root scope per case, reused across renders: render() sets exactly the
+  // keys this render needs and clears the rest to undefined. A key present
+  // with value undefined reads exactly as a missing key (lookup takes it and
+  // yields undefined; an if or a deeper path sees the same as absent), and
+  // rendering is sequential, so no render can see another's values.
+  // Null-prototype: the compiled templates read first path segments straight
+  // off this object, and no Object.prototype member may leak in as a value.
+  const rootVars = Object.assign(Object.create(null), { site, tags: allTags, recent, page: undefined, posts: undefined, pager: undefined, tag: undefined });
+  const rootScope = { vars: rootVars, parent: null };
+  const render = (name, page, plist, pager, tag) => {
+    rootVars.page = page;
+    rootVars.posts = plist;
+    rootVars.pager = pager;
+    rootVars.tag = tag;
     const out = [];
-    renderNodes(nodes, { vars: { site, tags: allTags, recent, ...vars }, parent: null }, ctx, 0, out);
+    if (compiled !== null) {
+      const fn = compiled.get(name);
+      if (fn === undefined) return null;
+      fn(out, rootVars, 0, X);
+    } else {
+      const nodes = templates.get(name);
+      if (nodes === undefined) return null;
+      renderNodes(nodes, rootScope, ctx, 0, out);
+    }
     return out.join('');
   };
   const output = {};
   for (const s of kept) {
-    // A post's card is already built (cards map); a page's is built once here.
-    const baseCard = s.post ? cards.get(s) : cardOf(s);
-    const page = {
-      ...baseCard,
-      slug: s.slug,
-      content: s.html,
-      toc: s.toc.map((h) => ({ level: h.level, id: h.id, html: h.html })),
-      newer: linkOf(s.newer ?? null),
-      older: linkOf(s.older ?? null),
-      is_post: s.post,
-    };
-    output[`${s.outDir}/index.html`] = render(s.layout, { page });
+    output[`${s.outDir}/index.html`] = render(s.layout, s, undefined, undefined, undefined);
   }
   const per = input.site.per_page;
   const pages = Math.max(1, Math.ceil(posts.length / per));
   const indexUrl = (k) => (k === 1 ? `${base}/` : `${base}/page/${k}/`);
   for (let k = 1; k <= pages; k++) {
-    const html = render('index', {
-      posts: posts.slice((k - 1) * per, k * per).map((p) => cards.get(p)),
-      pager: { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) },
-    });
+    const html = render('index', undefined, posts.slice((k - 1) * per, k * per),
+      { number: k, total: pages, url: indexUrl(k), newer_url: k === 1 ? '' : indexUrl(k - 1), older_url: k === pages ? '' : indexUrl(k + 1) }, undefined);
     if (html !== null) output[k === 1 ? 'index.html' : `page/${k}/index.html`] = html;
   }
   for (const t of tags) {
-    const html = render('tag', {
-      tag: { name: t.name, slug: t.slug, url: t.url, count: t.posts.length, posts: t.posts.map((p) => cards.get(p)) },
-    });
+    const html = render('tag', undefined, undefined, undefined, t);
     if (html !== null) output[`tags/${t.slug}/index.html`] = html;
   }
-  const tagsHtml = render('tags', {});
+  const tagsHtml = render('tags', undefined, undefined, undefined, undefined);
   if (tagsHtml !== null) output['tags/index.html'] = tagsHtml;
   for (const f of statics) {
     if (Object.hasOwn(output, f.path)) report.push(`shadowed ${f.path}: a built page has its path`);
