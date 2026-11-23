@@ -1,3 +1,8 @@
+import { setFlagsFromString } from 'node:v8';
+// Cold-cost cut (R4): disable the optimising compiler. A fresh process never
+// runs long enough for TurboFan to pay back its background compile CPU (the
+// score is CPU time, all threads included), while Maglev keeps hot speed.
+setFlagsFromString('--no-opt');
 // Fast drop-in for makefun-site 1.0.0 (make.fun's own static site generator).
 // run(input) returns exactly the answer makefun-site 1.0.0's build returns for
 // the same input: the output tree as a JSON object of path -> text, byte for
@@ -925,6 +930,35 @@ function lookupExpr(path, scope) {
 }
 
 /**
+ * The templates reachable from `roots` through includes (a template only
+ * renders when a layout, the index, a tag page or the tags page reaches it,
+ * so the rest never needs compiling). `templates` holds parsed nodes.
+ */
+function reachableTemplates(templates, roots) {
+  const out = new Set();
+  const stack = [...roots].filter((n) => templates.has(n));
+  while (stack.length > 0) {
+    const name = stack.pop();
+    if (out.has(name)) continue;
+    const nodes = templates.get(name);
+    if (nodes === undefined) continue; // an include of a missing template renders nothing
+    out.add(name);
+    const walk = (ns) => {
+      for (const node of ns) {
+        if (node.kind === 'include') stack.push(node.name);
+        else if (node.kind === 'for') walk(node.body);
+        else if (node.kind === 'if') {
+          walk(node.then);
+          if (node.else !== null) walk(node.else);
+        }
+      }
+    };
+    walk(nodes);
+  }
+  return out;
+}
+
+/**
  * The templates whose render depends only on case-constant inputs (site,
  * tags, recent) and the include depth — so the same (name, depth) renders
  * byte-identically every time in a case and may be cached. A template is
@@ -1165,17 +1199,6 @@ export function build(input) {
     }
   }
 
-  // Compiled templates for this case; null when code generation is
-  // unavailable, in which case the interpreter below renders instead.
-  const constSet = analyzeConstant(templates);
-  let compiled = null;
-  try {
-    compiled = new Map();
-    for (const [tname, tnodes] of templates) compiled.set(tname, compileTemplate(tname, tnodes, constSet));
-  } catch (err) {
-    compiled = null;
-  }
-  const X = compiled === null ? null : { fns: compiled, cache: new Map() };
   const base = input.site.base_url.replace(/\/+$/, '');
   const sources = [];
   const statics = [];
@@ -1382,6 +1405,24 @@ export function build(input) {
     }
     return out.join('');
   };
+  // Compiled templates for this case (lazy: only the reachable ones — the
+  // layouts this case actually uses, plus index/tag/tags — ever render, so
+  // the rest never pays a `new Function` compile). Null when code generation
+  // is unavailable, in which case the interpreter below renders instead.
+  // Parsing above still covers every template, so a parse error in an
+  // unreachable template is still reported exactly as the reference does.
+  const constSet = analyzeConstant(templates);
+  const roots = new Set(['index', 'tag', 'tags']);
+  for (const s of kept) roots.add(s.layout);
+  const reach = reachableTemplates(templates, roots);
+  let compiled = null;
+  try {
+    compiled = new Map();
+    for (const tname of reach) compiled.set(tname, compileTemplate(tname, templates.get(tname), constSet));
+  } catch (err) {
+    compiled = null;
+  }
+  const X = compiled === null ? null : { fns: compiled, cache: new Map() };
   const output = {};
   for (const s of kept) {
     output[`${s.outDir}/index.html`] = render(s.layout, s, undefined, undefined, undefined);
