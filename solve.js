@@ -173,6 +173,9 @@ function daysIn(y, m) {
 function stringOf(raw) {
   if (raw.charCodeAt(0) === 34) {
     if (raw.length < 2 || raw.charCodeAt(raw.length - 1) !== 34) return { error: 'a quoted string is not closed' };
+    // Fast path: no backslash and no interior quote — the value is the
+    // slice itself (the loop below would copy it character by character).
+    if (raw.indexOf('\\', 1) === -1 && raw.indexOf('"', 1) === raw.length - 1) return { value: raw.slice(1, -1) };
     let out = '';
     for (let i = 1; i < raw.length - 1; i++) {
       const c = raw[i];
@@ -552,7 +555,8 @@ function inline(s, link) {
 }
 
 /**
- * `src` rendered in one pass over its characters: its HTML, its table of
+ * `src` rendered in one pass over its characters: its HTML as a parts array
+ * (fused straight into the page render — no join here), its table of
  * contents (every level 2 and 3 heading) and its excerpt (the first
  * paragraph's inline HTML, or ""). No line array is built: the scan walks
  * line ranges [pos, le) with indexOf('\n'), and every block test is a
@@ -765,7 +769,8 @@ function renderMarkdown(src, link, slugMemo) {
       }
     }
   }
-  return { html: parts.join(''), toc, excerpt: excerpt ?? '' };
+  parts[PARTS] = true;
+  return { parts, toc, excerpt: excerpt ?? '' };
 }
 
 // ---------------------------------------------------------------- templates
@@ -884,12 +889,14 @@ function lookup(scope, path) {
   return v;
 }
 
+const PARTS = Symbol('parts');
+
 /** A value as text. */
 function textOf(v) {
   if (typeof v === 'string') return v;
   if (typeof v === 'number') return String(v);
   if (typeof v === 'boolean') return v ? 'true' : 'false';
-  if (Array.isArray(v)) return v.map(textOf).join(', ');
+  if (Array.isArray(v)) return v[PARTS] === true ? v.join('') : v.map(textOf).join(', ');
   return '';
 }
 
@@ -918,12 +925,12 @@ function escTxt(v) {
 
 /**
  * The lookup of `path` in scope variable `scope`, as generated code. The
- * scope is a null-prototype chain (the root vars, then one Object.create
- * per enclosing for), so a first segment reads exactly as the reference's
- * hasOwn walk: a missing name is undefined, and no Object.prototype member
- * can leak in. Deeper segments keep the reference's own guard (null, not an
- * object, or not an own property yields undefined). `_t` is the generated
- * function's scratch variable.
+ * scope is one flat null-prototype object (the root vars, with for-variables
+ * saved on it while their loop runs), so a first segment reads exactly as
+ * the reference's hasOwn walk: a missing name is undefined, and no
+ * Object.prototype member can leak in. Deeper segments keep the reference's
+ * own guard (null, not an object, or not an own property yields undefined).
+ * `_t` is the generated function's scratch variable.
  */
 function lookupExpr(path, scope) {
   if (path.length === 1) return `${scope}.${path[0]}`;
@@ -1028,15 +1035,15 @@ function analyzeConstant(templates) {
 
 /**
  * A parsed template's nodes compiled to a function (out, S, D, X, esc, txt,
- * tr): S is the scope's vars object (null-prototype chain), D the include
+ * tr): S is the scope's vars object (one flat null-prototype object), D the include
  * depth, X the context { fns, cache }, and esc/txt/tr the helpers as direct
  * parameters (no per-call property lookup). Straight-line code replaces the
  * walk: no per-node dispatch, no recursion except through includes (which
- * are direct calls, depth-checked like the reference). A for-node reuses one
- * child scope and one loop record per execution, mutated per iteration —
- * rendering is synchronous and depth-first, and each include is a fresh
- * invocation with its own locals, so no iteration can observe another's
- * values. When the loop variable is named `loop`, the item assignment is
+ * are direct calls, depth-checked like the reference). A for-node saves its
+ * loop variable (and `loop`) on the one flat scope object, assigns per
+ * iteration, and restores after — rendering is synchronous and depth-first,
+ * and save/restore nests, so no iteration can observe another's values.
+ * When the loop variable is named `loop`, the item assignment is
  * overwritten by the loop record each iteration, exactly as the reference's
  * object literal (whose later `loop` key wins) does.
  */
@@ -1049,7 +1056,16 @@ function compileTemplate(name, nodes, constSet) {
         code += `out.push(${JSON.stringify(node.text)});\n`;
       } else if (node.kind === 'var' || node.kind === 'raw') {
         const l = lookupExpr(node.path, scope);
-        code += node.kind === 'var' ? `out.push(et(${l}));\n` : `out.push(txt(${l}));\n`;
+        if (node.path.length === 2 && node.path[0] === 'page' && node.path[1] === 'content') {
+          // The markdown parts array: spread it straight into the output
+          // (raw) or join-then-escape it (escaped) — never via textOf,
+          // which would join an array with ', '.
+          const v = `_vp${n++}`;
+          if (node.kind === 'raw') code += `const ${v}=${l};if(Array.isArray(${v}))out.push(...${v});else out.push(txt(${v}));\n`;
+          else code += `const ${v}=${l};out.push(et(Array.isArray(${v})?${v}.join(''):${v}));\n`;
+        } else {
+          code += node.kind === 'var' ? `out.push(et(${l}));\n` : `out.push(txt(${l}));\n`;
+        }
       } else if (node.kind === 'if') {
         const l = lookupExpr(node.path, scope);
         const cond = node.not ? `!tr(${l})` : `tr(${l})`;
@@ -1065,16 +1081,22 @@ function compileTemplate(name, nodes, constSet) {
       } else if (node.kind === 'for') {
         const id = n++;
         const xs = `_xs${id}`;
-        const cv = `_cv${id}`;
+        const sv = `_sv${id}`;
+        const sl = `_sl${id}`;
         const lp = `_lp${id}`;
         const k = `_k${id}`;
         const l = lookupExpr(node.path, scope);
-        code += `{const ${xs}=${l};if(Array.isArray(${xs})){const ${cv}=Object.create(${scope});const ${lp}={index:0,first:false,last:false,length:${xs}.length};`;
-        if (node.name !== 'loop') code += `${cv}.loop=${lp};`;
-        code += `for(let ${k}=0;${k}<${xs}.length;${k}++){${cv}.${node.name}=${xs}[${k}];${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===${xs}.length-1;`;
-        if (node.name === 'loop') code += `${cv}.loop=${lp};`;
-        gen(node.body, cv);
-        code += '}}}\n';
+        // Flat scope: save the loop variable and `loop` on the one scope
+        // object, assign per iteration, restore after — no child scope
+        // object per execution, and every read is an own-property read.
+        // Rendering is synchronous and depth-first, and save/restore nests,
+        // so no iteration can observe another's values.
+        code += `{const ${xs}=${l};if(Array.isArray(${xs})){const ${sv}=${scope}.${node.name};const ${sl}=${scope}.loop;const ${lp}={index:0,first:false,last:false,length:${xs}.length};`;
+        if (node.name !== 'loop') code += `${scope}.loop=${lp};`;
+        code += `for(let ${k}=0;${k}<${xs}.length;${k}++){${scope}.${node.name}=${xs}[${k}];${lp}.index=${k}+1;${lp}.first=${k}===0;${lp}.last=${k}===${xs}.length-1;`;
+        if (node.name === 'loop') code += `${scope}.loop=${lp};`;
+        gen(node.body, scope);
+        code += `}${scope}.${node.name}=${sv};${scope}.loop=${sl};}}\n`;
       } else if (node.kind === 'include') {
         if (constSet.has(node.name)) {
           // Constant: the same (name, depth) renders identically every time
@@ -1278,25 +1300,41 @@ export function build(input) {
   const staticPaths = new Set(statics.map((f) => f.path));
   const broken = new Set();
   const SCHEME = /^[A-Za-z][A-Za-z0-9+.-]*:/;
+  // Resolved links, memoised per (directory, target): the URL depends only
+  // on those two, never on the source file. null means "broken": the
+  // broken.add below still runs per source, since its entry names it.
+  const linkCache = new Map();
   for (const s of kept) {
     const dir = dirOf(s.path);
     const spath = s.path;
     const link = (target) => {
       if (SCHEME.test(target) || target.startsWith('/') || target.startsWith('#')) return target;
+      let byDir = linkCache.get(dir);
+      if (byDir === undefined) {
+        byDir = new Map();
+        linkCache.set(dir, byDir);
+      }
+      const hit = byDir.get(target);
+      if (hit !== undefined) {
+        if (hit === null) broken.add(`broken-link ${spath} -> ${target}`);
+        return hit === null ? target : hit;
+      }
       const hash = target.indexOf('#');
       const rel = hash === -1 ? target : target.slice(0, hash);
       const frag = hash === -1 ? '' : target.slice(hash);
       const path = rel === '' ? null : resolvePath(dir, rel);
+      let url = null;
       if (path !== null) {
         const page = bySource.get(path);
-        if (page !== undefined) return `${page.url}${frag}`;
-        if (staticPaths.has(path)) return `${base}/${path}${frag}`;
+        if (page !== undefined) url = `${page.url}${frag}`;
+        else if (staticPaths.has(path)) url = `${base}/${path}${frag}`;
       }
-      broken.add(`broken-link ${spath} -> ${target}`);
-      return target;
+      byDir.set(target, url);
+      if (url === null) broken.add(`broken-link ${spath} -> ${target}`);
+      return url === null ? target : url;
     };
     const md = renderMarkdown(s.body, link, slugMemo);
-    s.html = md.html;
+    s.content = md.parts;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
   }
@@ -1374,7 +1412,6 @@ export function build(input) {
     s.date = s.data.date ?? '';
     s.date_long = s.data.date === undefined ? '' : longDate(s.data.date, dateMemo);
     s.summary = s.data.summary ?? '';
-    s.content = s.html;
     s.is_post = s.post;
     s.tags = s.tagRefs.map((t) => (t[TAG_VIEW] ??= { name: t.name, slug: t.slug, url: t.url }));
     if (s.post) s.reading_minutes = readingMinutes(s);
